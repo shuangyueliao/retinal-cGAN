@@ -1,6 +1,7 @@
 import numpy as np
 from PIL import Image
-
+from torchvision import datasets
+import torch
 
 def is_image_file(filename):
     return any(filename.endswith(extension) for extension in [".png", ".jpg", ".jpeg"])
@@ -19,5 +20,4 @@ def save_img(image_tensor, filename):
     image_pil = Image.fromarray(image_numpy)
     image_pil.save(filename)
     #print("Image saved as {}".format(filename))
-
 

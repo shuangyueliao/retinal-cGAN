@@ -1,25 +1,22 @@
 import os, sys
+import time
 import argparse
 import torch.optim as optim
 import numpy as np
 from PIL import Image
-import torch, visdom
+import torch
 import torch.nn.functional as F
 import torch.utils.data as data_utils
 import torch.nn as nn
 from torch.autograd import Variable
-from util import is_image_file, load_img, save_img
-import torchvision.models as models
-import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
 from dataset import VOC2012Dataset
-from model import FCN8s, FCN16s, FCN32s
-from networks import define_G, define_D, GANLoss, print_network
+from cgan import discriminator, Generator
 import logging
 import cv2
 from skimage.transform import rotate
 
 VOC2012_PATH = './VOC2012'
-# VOC2012_PATH='/home/masao/voc2012/VOC2012'
 
 """ Usage
 python -m visdom.server
@@ -65,168 +62,70 @@ def train(args):
 
     loader_train = data_utils.DataLoader(ds_train,
                                          batch_size=args.batch_size,
-                                         num_workers=args.nb_worker, shuffle=True)
-    vis = visdom.Visdom()
-    netG = define_G(3, 3, 64, 'batch', False, [0])
-    netD = define_D('noReLU', 6, 64, 'batch', False, [0])
-    criterionGAN = GANLoss()
-    criterionL1 = nn.L1Loss()
-    # criterionMSE = nn.MSELoss()
-
-    if args.model == 'fcn8s':
-        model = FCN8s()
-    elif args.model == 'fcn16s':
-        model = FCN16s()
-    elif args.model == 'fcn32s':
-        model = FCN32s()
-
-    print(netD)
-
-    vgg16 = models.vgg16(pretrained=True)
-
-    model.init_params(vgg16)
+                                         num_workers=1, shuffle=True)
+    G = Generator(64)
+    D = discriminator(64)
+    G.weight_init(mean=0.0, std=0.02)
+    D.weight_init(mean=0.0, std=0.02)
+    G.cuda()
+    D.cuda()
+    G.train()
+    D.train()
+    BCE_Loss = nn.BCELoss().cuda()
+    L1_Loss = nn.L1Loss().cuda()
 
     print("init_params done.")
-
-    if torch.cuda.is_available():
-        #        model=torch.load('./models/fcn8s.pkl')
-        model.cuda(0)
-
-        img_test, segmap_test, _, _, _ = ds_train[1]
-        img_test = Variable(img_test.unsqueeze(0).cuda(0))
-    else:
-        print("cuda required.")
-        sys.exit(0)
 
     if not os.path.exists("./models"):
         os.mkdir("./models")
 
-    optimizer = torch.optim.Adamax(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    optimizerG = optim.Adam(netG.parameters(), lr=0.0002, betas=(0.5, 0.999))
-    optimizerD = optim.Adam(netD.parameters(), lr=0.0002, betas=(0.5, 0.999))
+    G_optimizer = optim.Adam(G.parameters(), lr=opt.lrG, betas=(opt.beta1, opt.beta2))
+    D_optimizer = optim.Adam(D.parameters(), lr=opt.lrD, betas=(opt.beta1, opt.beta2))
 
     real_a = torch.FloatTensor(1, 3, 256, 256)
     real_b = torch.FloatTensor(1, 3, 256, 256)
-    #    netD=torch.load('./models/D.pkl')
-    #    netG=torch.load('./models/G.pkl')
-    netD = netD.cuda()
-    netG = netG.cuda()
-    criterionGAN = criterionGAN.cuda()
-    criterionL1 = criterionL1.cuda()
-    # criterionMSE = criterionMSE.cuda()
+
     real_a = real_a.cuda()
     real_b = real_b.cuda()
     real_a = Variable(real_a)
     real_b = Variable(real_b)
-    transform_list = [transforms.ToTensor(),
-                      transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5))]
-    transform = transforms.Compose(transform_list)
-    for epoch in range(args.nb_epoch):
-        FCN_losses = []
+
+    for epoch in range(opt.train_epoch):
         D_losses = []
         G_losses = []
-        for i, (images, gts, realA, realB, status) in enumerate(loader_train):
-            if status[0] == 1:
-                images = Variable(images.cuda(0))
-                gts = Variable(gts.cuda(0))
-                real_a_cpu, real_b_cpu = realA, realB
-                real_a.data.resize_(real_a_cpu.size()).copy_(real_a_cpu)
-                real_b.data.resize_(real_b_cpu.size()).copy_(real_b_cpu)
-                outputs = model(images)
-                predicted = ds_train.decode_segmap(outputs[0].cpu().data.numpy().argmax(0))
-                tmp = np.transpose(predicted, [2, 0, 1])
-                hiimage(tmp)
-                fake_b = load_img('./tmp.jpg')
-                fake_b = transform(fake_b)
-                fake_b = Variable(fake_b.cuda(0))
-                fake_b = torch.unsqueeze(fake_b, 0)
-                fake_a = netG(real_b)
-                ###########################
-                optimizerD.zero_grad()
-                # train with fake
-                fake_ab = torch.cat((real_a, fake_b), 1)  #
-                pred_fake = netD.forward(fake_ab.detach())  #
-                loss_d_fake = criterionGAN(pred_fake, False)  #
-                # train with fake
-                fake_ab1 = torch.cat((fake_a, real_b), 1)
-                pred_fake1 = netD.forward(fake_ab1.detach())
-                loss_d_fake1 = criterionGAN(pred_fake1, False)
-                # train with real
-                real_ab = torch.cat((real_a, real_b), 1)
-                pred_real = netD.forward(real_ab)
-                loss_d_real = criterionGAN(pred_real, True)
-                # Combined loss
-                loss_d = (loss_d_fake + loss_d_real + loss_d_fake1) / 3
-                D_losses.append(loss_d.data[0])
-                loss_d.backward()
-                optimizerD.step()
-                ############################
-                optimizer.zero_grad()
-                realA_fakeB = torch.cat((real_a, fake_b), 1)  #
-                realA_fakeB_result = netD.forward(realA_fakeB)  #
-                loss1 = torch.nn.CrossEntropyLoss()(outputs, gts)
-                loss2 = criterionGAN(realA_fakeB_result, True)  #
-                loss = loss1 + loss2
-                FCN_losses.append(loss.data[0])
-                loss.backward()
-                optimizer.step()
-                ##################################
-                optimizerG.zero_grad()
-                fake_ab = torch.cat((fake_a, real_b), 1)
-                pred_fake = netD.forward(fake_ab)
-                loss_g_gan = criterionGAN(pred_fake, True)
-                loss_g_l1 = criterionL1(fake_a, real_a) * 10
-                loss_g = loss_g_gan + loss_g_l1
-                loss_g.backward()
-                G_losses.append(loss_g.data[0])
-                optimizerG.step()
-                out = fake_a.cpu()
-                out_img = out.data[0]
-                save_img(out_img, "result_a.jpg")
-                ######################################
-            else:
-                images = Variable(images.cuda(0))
-                real_a_cpu = realA
-                real_a.data.resize_(real_a_cpu.size()).copy_(real_a_cpu)
-                outputs = model(images)
-                predicted = ds_train.decode_segmap(outputs[0].cpu().data.numpy().argmax(0))
-                tmp = np.transpose(predicted, [2, 0, 1])
-                hiimage(tmp)
-                fake_b = load_img('./tmp.jpg')
-                fake_b = transform(fake_b)
-                fake_b = Variable(fake_b.cuda(0))
-                fake_b = torch.unsqueeze(fake_b, 0)
-                ###########################
-                optimizerD.zero_grad()
-                # train with fake
-                fake_ab = torch.cat((real_a, fake_b), 1)  #
-                pred_fake = netD.forward(fake_ab.detach())  #
-                loss_d_fake = criterionGAN(pred_fake, False)  #
-                loss_d = loss_d_fake
-                loss_d.backward()
-                optimizerD.step()
+        epoch_start_time = time.time()
+        print('training epoch {}'.format(epoch + 1))
+        for i, (realA, realB) in enumerate(loader_train):
+            real_a_cpu, real_b_cpu = realA, realB
+            real_a.data.resize_(real_a_cpu.size()).copy_(real_a_cpu)
+            real_b.data.resize_(real_b_cpu.size()).copy_(real_b_cpu)
 
-        print(epoch)
+            D.zero_grad()
+            D_result = D(real_a, real_b).squeeze()
+            D_real_loss = BCE_Loss(D_result, torch.Tensor(torch.ones(D_result.size())).cuda())
 
-        if False:
-            output_test = model(img_test)
-            predicted = ds_train.decode_segmap(output_test[0].cpu().data.numpy().argmax(0))
-            # predicted = cv2.linearPolar(rotate(predicted, 90), (256 / 2, 256 / 2), 256 / 2,cv2.WARP_FILL_OUTLIERS + cv2.WARP_INVERSE_MAP)  # 极坐标转直角坐标
-            target = ds_train.decode_segmap(segmap_test.numpy())
-            # target = cv2.linearPolar(rotate(target, 90), (256 / 2, 256 / 2), 256 / 2,cv2.WARP_FILL_OUTLIERS + cv2.WARP_INVERSE_MAP)  # 极坐标转直角坐标
+            G_result = G(real_a)
+            D_result = D(real_a, G_result).squeeze()
+            D_fake_loss = BCE_Loss(D_result, torch.Tensor(torch.zeros(D_result.size())).cuda())
 
-            vis.image(img_test[0].cpu().data.numpy(), opts=dict(title='Train Input - e' + str(epoch)))
-            vis.image(np.transpose(target, [2, 0, 1]), opts=dict(title='Train GT - e' + str(epoch)))
-            vis.image(np.transpose(predicted, [2, 0, 1]), opts=dict(title='Train Predicted - e' + str(epoch)))
+            D_train_loss = (D_real_loss + D_fake_loss) * 0.5
+            D_train_loss.backward()
+            D_optimizer.step()
 
+            G.zero_grad()
+            G_result = G(real_a)
+            D_result = D(real_a, G_result).squeeze()
+            plt.imsave('result.png', (G_result[0].cpu().data.numpy().transpose(1, 2, 0) + 1) / 2)
+            G_train_loss = BCE_Loss(D_result, torch.Tensor(torch.ones(D_result.size())).cuda()) + opt.L1_lambda * L1_Loss( G_result, real_b)
+            G_train_loss.backward()
+            G_optimizer.step()
         # if (epoch % 50 == 0):
         #     torch.save(model, "./models/fcn8s{}.pkl".format(epoch))
         #     torch.save(netG, "./models/G{}.pkl".format(epoch))
         #     torch.save(netD, './models/D{}.pkl'.format(epoch))
 
-    torch.save(model, "./models/{}.pkl".format(args.model))
-    torch.save(netG, "./models/G.pkl")
-    torch.save(netD, './models/D.pkl')
+    torch.save(G, "./models/G.pkl")
+    torch.save(D, './models/D.pkl')
 
 
 def xcross_entropy2d(input, target, weight=None, size_average=True):
@@ -245,27 +144,29 @@ def xcross_entropy2d(input, target, weight=None, size_average=True):
 
 
 if __name__ == '__main__':
-    """
-    Adamax default : lr=2e-3 weight_decay=0
-    FCN : --lr=1e-4 --weight_decay=5.0e-7
-    """
     logging.basicConfig(filename='loss.log', level=logging.INFO, filemode='w')
-    parser = argparse.ArgumentParser(description='FCN for VOC2012')
-    parser.add_argument('--model', type=str, default='fcn8s',
-                        help='model to use: fcn8s, fcn16s, fcn32s')
-    parser.add_argument('--nb_epoch', type=int, default=200,
-                        help='# of epochs')
-    parser.add_argument('--batch_size', type=int, default=1,
-                        help='batch_size')
-    parser.add_argument('--nb_worker', type=int, default=1,
-                        help='# of workers')
-    parser.add_argument('--lr', type=float, default=1e-4,  # 5e-5,
-                        help='Learning Rate')
-    parser.add_argument('--weight_decay', type=float, default=5.0e-7,
-                        help='weight decay')
-    args = parser.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--dataset', required=False, default='train_img', help='')
+    parser.add_argument('--train_subfolder', required=False, default='combine', help='')
+    parser.add_argument('--test_subfolder', required=False, default='test', help='')
+    parser.add_argument('--batch_size', type=int, default=1, help='train batch size')
+    parser.add_argument('--test_batch_size', type=int, default=5, help='test batch size')
+    parser.add_argument('--ngf', type=int, default=64)
+    parser.add_argument('--ndf', type=int, default=64)
+    # parser.add_argument('--input_size', type=int, default=256, help='input size')
+    # parser.add_argument('--crop_size', type=int, default=256, help='crop size (0 is false)')
+    # parser.add_argument('--resize_scale', type=int, default=286, help='resize scale (0 is false)')
+    # parser.add_argument('--fliplr', type=bool, default=True, help='random fliplr True or False')
+    parser.add_argument('--train_epoch', type=int, default=100, help='number of train epochs')
+    parser.add_argument('--lrD', type=float, default=0.0002, help='learning rate, default=0.0002')
+    parser.add_argument('--lrG', type=float, default=0.0002, help='learning rate, default=0.0002')
+    parser.add_argument('--L1_lambda', type=float, default=100, help='lambda for L1 loss')
+    parser.add_argument('--beta1', type=float, default=0.5, help='beta1 for Adam optimizer')
+    parser.add_argument('--beta2', type=float, default=0.999, help='beta2 for Adam optimizer')
+    parser.add_argument('--save_root', required=False, default='results', help='results save path')
+    parser.add_argument('--inverse_order', type=bool, default=True, help='0: [input, target], 1 - [target, input]')
+    opt = parser.parse_args()
 
-    train(args)
+    train(opt)
 
 ### EOF ###
-
